@@ -1,11 +1,10 @@
 use sqlx::postgres::PgPoolOptions;
-use axum::{Router, routing::get};
+use axum::{Router, routing::get, routing::post};
 use dotenvy::dotenv;
 use std::env;
+use tower_http::cors::{CorsLayer, Any};
 
-mod config;
 mod routes;
-mod utils;
 
 #[tokio::main]
 async fn main() {
@@ -24,12 +23,18 @@ async fn main() {
     sqlx::migrate!("./migrations")
         .run(&pool)
         .await
-        .expect("Failed to run migrations"); 
+        .expect("Failed !");
+
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
 
     let app = Router::new()
         .route("/", get(|| async { "Auth API is running !" }))
-        .route("/register", axum::routing::post(routes::auth::register))
-        .route("/login", axum::routing::post(routes::auth::login))
+        .route("/register", post(routes::auth::register))
+        .route("/login", post(routes::auth::login))
+        .layer(cors)
         .with_state(pool);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();

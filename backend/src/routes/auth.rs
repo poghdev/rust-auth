@@ -1,9 +1,11 @@
-use axum::{Json, extract::State, response::IntoResponse, http::StatusCode};
+use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
+use axum_extra::extract::cookie::{Cookie, CookieJar};
+use bcrypt::{DEFAULT_COST, hash, verify};
+use jsonwebtoken::{EncodingKey, Header, encode};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use bcrypt::{hash, verify, DEFAULT_COST};
-use jsonwebtoken::{encode, Header, EncodingKey};
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::env;
 
 #[derive(Deserialize)]
 pub struct AuthRequest {
@@ -19,12 +21,12 @@ pub struct AuthResponse {
 #[derive(Serialize, Deserialize)]
 struct Claims {
     sub: String,
-    exp: usize, 
+    exp: usize,
 }
 
 pub async fn register(
-    State(pool): State<PgPool>, 
-    Json(payload): Json<AuthRequest>
+    State(pool): State<PgPool>,
+    Json(payload): Json<AuthRequest>,
 ) -> impl IntoResponse {
     let hashed_password = match hash(payload.password, DEFAULT_COST) {
         Ok(h) => h,
@@ -47,28 +49,45 @@ pub async fn register(
 
 pub async fn login(
     State(pool): State<PgPool>,
+    jar: CookieJar,
     Json(payload): Json<AuthRequest>,
 ) -> impl IntoResponse {
-    let user = sqlx::query!("SELECT password_hash FROM users WHERE username = $1", payload.username)
-        .fetch_optional(&pool)
-        .await;
+    let user = sqlx::query!(
+        "SELECT password_hash FROM users WHERE username = $1",
+        payload.username
+    )
+    .fetch_optional(&pool)
+    .await;
 
     if let Ok(Some(row)) = user {
-        if verify(payload.password, &row.password_hash).unwrap_or(false) {
+        if verify(&payload.password, &row.password_hash).unwrap_or(false) {
             let expiration = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
-                .as_secs() + 3600;
+                .as_secs()
+                + 3600;
 
-            let claims = Claims { sub: payload.username, exp: expiration as usize };
+            let claims = Claims {
+                sub: payload.username,
+                exp: expiration as usize,
+            };
+
+            let secret = env::var("JWT_SECRET").unwrap_or_else(|_| "default_secret_keep_it_safe".to_string());
 
             let token = encode(
                 &Header::default(),
                 &claims,
-                &EncodingKey::from_secret("secret".as_ref()),
-            ).unwrap();
+                &EncodingKey::from_secret(secret.as_ref()),
+            )
+            .unwrap();
 
-            return (StatusCode::OK, Json(AuthResponse { token })).into_response();
+            let cookie = Cookie::build(("jwt", token.clone()))
+                .path("/")
+                .http_only(true)
+                .secure(false)
+                .finish();
+
+            return (jar.add(cookie), Json(AuthResponse { token })).into_response();
         }
     }
 
