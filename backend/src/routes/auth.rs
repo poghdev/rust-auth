@@ -1,95 +1,63 @@
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
-use axum_extra::extract::cookie::{Cookie, CookieJar};
-use bcrypt::{DEFAULT_COST, hash, verify};
+use axum::http::header::{HeaderMap, SET_COOKIE};
 use jsonwebtoken::{EncodingKey, Header, encode};
-use serde::{Deserialize, Serialize};
+use axum::http::header::COOKIE;
 use sqlx::PgPool;
+use argon2::{password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},Argon2,};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::env;
 
-#[derive(Deserialize)]
-pub struct AuthRequest {
-    pub username: String,
-    pub password: String,
-}
+use crate::models::{AuthRequest, AuthResponse, Claims};
 
-#[derive(Serialize)]
-pub struct AuthResponse {
-    pub token: String,
-}
-
-#[derive(Serialize, Deserialize)]
-struct Claims {
-    sub: String,
-    exp: usize,
-}
-
-pub async fn register(
-    State(pool): State<PgPool>,
-    Json(payload): Json<AuthRequest>,
-) -> impl IntoResponse {
-    let hashed_password = match hash(payload.password, DEFAULT_COST) {
-        Ok(h) => h,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Error hashing").into_response(),
-    };
-
-    let result = sqlx::query!(
-        "INSERT INTO users (username, password_hash) VALUES ($1, $2)",
-        payload.username,
-        hashed_password
-    )
-    .execute(&pool)
-    .await;
-
-    match result {
-        Ok(_) => (StatusCode::CREATED, "User registered").into_response(),
-        Err(_) => (StatusCode::BAD_REQUEST, "User already exists").into_response(),
+pub async fn register(State(pool): State<PgPool>, Json(payload): Json<AuthRequest>) -> Result<impl IntoResponse, StatusCode> {
+    let username_len = payload.username.trim().chars().count();
+    if username_len < 3 || username_len > 10 {
+        return Err(StatusCode::BAD_REQUEST);
     }
+    if payload.password.chars().count() < 8 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let salt = SaltString::generate(&mut OsRng);
+    let argon2 = Argon2::default();
+
+    let password_hash = argon2.hash_password(payload.password.as_bytes(), &salt).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?.to_string();
+
+    sqlx::query!("INSERT INTO users (username, password_hash) VALUES ($1, $2)",payload.username,password_hash).execute(&pool).await.map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    Ok((StatusCode::CREATED, "User registered"))
 }
 
-pub async fn login(
-    State(pool): State<PgPool>,
-    jar: CookieJar,
-    Json(payload): Json<AuthRequest>,
-) -> impl IntoResponse {
-    let user = sqlx::query!(
-        "SELECT password_hash FROM users WHERE username = $1",
-        payload.username
-    )
-    .fetch_optional(&pool)
-    .await;
+pub async fn login(State(pool): State<PgPool>, Json(payload): Json<AuthRequest>) -> Result<impl IntoResponse, StatusCode> {
+    let row = sqlx::query!("SELECT password_hash FROM users WHERE username = $1", payload.username).fetch_optional(&pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?.ok_or(StatusCode::UNAUTHORIZED)?;
 
-    if let Ok(Some(row)) = user {
-        if verify(&payload.password, &row.password_hash).unwrap_or(false) {
-            let expiration = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-                + 3600;
+    let parsed_hash = PasswordHash::new(&row.password_hash).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-            let claims = Claims {
-                sub: payload.username,
-                exp: expiration as usize,
-            };
+    Argon2::default().verify_password(payload.password.as_bytes(), &parsed_hash).map_err(|_| StatusCode::UNAUTHORIZED)?;
 
-            let secret = env::var("JWT_SECRET").unwrap_or_else(|_| "default_secret_keep_it_safe".to_string());
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-            let token = encode(
-                &Header::default(),
-                &claims,
-                &EncodingKey::from_secret(secret.as_ref()),
-            )
-            .unwrap();
+    let expiration = now.as_secs() + 3600;
+    let claims = Claims { sub: payload.username, exp: expiration as usize };
+    
+    let secret = env::var("JWT_SECRET").unwrap_or_else(|_| "temporary_dev_secret".to_string());
+    
+    let token = encode(&Header::default(),&claims,&EncodingKey::from_secret(secret.as_ref()),).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-            let cookie = Cookie::build(("jwt", token.clone()))
-                .path("/")
-                .http_only(true)
-                .secure(false)
-                .finish();
+    let cookie_value = format!("jwt={}; Path=/; HttpOnly; SameSite=Lax; Max-Age=3600",token);
 
-            return (jar.add(cookie), Json(AuthResponse { token })).into_response();
-        }
-    }
+    let mut headers = HeaderMap::new();
+    let header_value = cookie_value.parse().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    headers.insert(SET_COOKIE, header_value);
 
-    (StatusCode::UNAUTHORIZED, "Invalid credentials").into_response()
+    Ok((headers, Json(AuthResponse { message: "Success".into() })))
+}
+
+pub async fn get_token(headers: HeaderMap) -> Result<impl IntoResponse, StatusCode> {
+    let cookie_header = headers.get(COOKIE).and_then(|h| h.to_str().ok()).ok_or(StatusCode:: UNAUTHORIZED)?;
+
+    let token = cookie_header.split(';').find(|s| s.trim().starts_with("jwt=")).and_then(|s| s.split('=').nth(1)).ok_or(StatusCode::UNAUTHORIZED)?;
+    let secret = env::var("JWT_SECRET").unwrap_or_else(|_| "temporary_dev_secret".to_string());
+    let token_data = jsonwebtoken::decode::<Claims>(token,&jsonwebtoken::DecodingKey::from_secret(secret.as_ref()),&jsonwebtoken::Validation::default(),).map_err(|_| StatusCode::UNAUTHORIZED)?;
+
+    Ok(Json(serde_json::json!({ "username": token_data.claims.sub })))
 }

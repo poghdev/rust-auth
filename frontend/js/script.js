@@ -1,4 +1,4 @@
-const API_URL = 'http://localhost:3000';
+const API_URL = 'http://localhost:3000/api/v1/auth';
 
 document.getElementById('registerForm').addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -37,7 +37,6 @@ document.getElementById('loginForm').addEventListener('submit', async (e) => {
 
         if (response.ok) {
             const data = await response.json();
-            localStorage.setItem('token', data.token);
             console.log("Auth success");
             alert("Welcome back!");
         } else {
