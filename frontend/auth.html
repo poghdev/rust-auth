@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <title>Authentication Form</title>
+    <style>
+        .form-container {
+            transition: transform 0.5s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+    </style>
+</head>
+<body class="bg-gray-50 h-screen flex items-center justify-center font-sans">
+
+    <div class="w-full max-w-sm overflow-hidden bg-white shadow-sm border border-gray-100 rounded-2xl">
+        <div id="slider" class="form-container flex w-[200%]">
+            
+            <div class="w-1/2 p-8">
+                <h2 class="text-2xl font-light mb-8">Login</h2>
+                <form class="space-y-4">
+                    <input type="email" placeholder="Email" class="w-full border-b border-gray-200 py-2 outline-none focus:border-black transition-colors text-sm">
+                    <input type="password" placeholder="Password" class="w-full border-b border-gray-200 py-2 outline-none focus:border-black transition-colors text-sm">
+                    <button type="submit" class="w-full bg-black text-white py-3 rounded-full text-sm mt-4 hover:bg-gray-800 transition-colors">Login</button>
+                </form>
+                <p class="text-center text-xs text-gray-400 mt-6">
+                    Don't have an account? 
+                    <button onclick="toggleForm()" class="text-black font-medium">Sign up</button>
+                </p>
+            </div>
+
+            <div class="w-1/2 p-8">
+                <h2 class="text-2xl font-light mb-8">Register</h2>
+                <form class="space-y-4">
+                    <input type="text" placeholder="Name" class="w-full border-b border-gray-200 py-2 outline-none focus:border-black transition-colors text-sm">
+                    <input type="email" placeholder="Email" class="w-full border-b border-gray-200 py-2 outline-none focus:border-black transition-colors text-sm">
+                    <input type="password" placeholder="Password" class="w-full border-b border-gray-200 py-2 outline-none focus:border-black transition-colors text-sm">
+                    <button type="submit" class="w-full bg-black text-white py-3 rounded-full text-sm mt-4 hover:bg-gray-800 transition-colors">Create account</button>
+                </form>
+                <p class="text-center text-xs text-gray-400 mt-6">
+                    Already have an account? 
+                    <button onclick="toggleForm()" class="text-black font-medium">Login</button>
+                </p>
+            </div>
+
+        </div>
+    </div>
+
+    <script>
+        const slider = document.getElementById('slider');
+        let isLogin = true;
+
+        function toggleForm() {
+            isLogin = !isLogin;
+            slider.style.transform = isLogin ? 'translateX(0)' : 'translateX(-50%)';
+        }
+    </script>
+</body>
+</html>
