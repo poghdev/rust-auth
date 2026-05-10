@@ -3,6 +3,7 @@ use axum::http::header::{HeaderMap, SET_COOKIE};
 use jsonwebtoken::{EncodingKey, Header, encode};
 use axum::http::header::COOKIE;
 use sqlx::PgPool;
+use validator::Validate;
 use argon2::{password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},Argon2,};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::env;
@@ -10,13 +11,7 @@ use std::env;
 use crate::models::{AuthRequest, AuthResponse, Claims};
 
 pub async fn register(State(pool): State<PgPool>, Json(payload): Json<AuthRequest>) -> Result<impl IntoResponse, StatusCode> {
-    let username_len = payload.username.trim().chars().count();
-    if username_len < 3 || username_len > 10 {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    if payload.password.chars().count() < 8 {
-        return Err(StatusCode::BAD_REQUEST);
-    }
+    payload.validate().map_err(|_| StatusCode::BAD_REQUEST)?;
     let salt = SaltString::generate(&mut OsRng);
     let argon2 = Argon2::default();
 
@@ -28,6 +23,7 @@ pub async fn register(State(pool): State<PgPool>, Json(payload): Json<AuthReques
 }
 
 pub async fn login(State(pool): State<PgPool>, Json(payload): Json<AuthRequest>) -> Result<impl IntoResponse, StatusCode> {
+    payload.validate().map_err(|_| StatusCode::BAD_REQUEST)?;
     let row = sqlx::query!("SELECT password_hash FROM users WHERE username = $1", payload.username).fetch_optional(&pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?.ok_or(StatusCode::UNAUTHORIZED)?;
 
     let parsed_hash = PasswordHash::new(&row.password_hash).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
