@@ -1,5 +1,12 @@
 use serde::{Deserialize, Serialize};
 use validator::Validate;
+use sqlx::PgPool;
+
+#[derive(Clone)]
+pub struct AppState {
+    pub pool: PgPool,
+    pub jwt_secret: String,
+}
 
 #[derive(Deserialize, Validate)]
 pub struct AuthRequest {
@@ -15,8 +22,9 @@ pub struct AuthResponse {
     pub message: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct Claims {
     pub sub: String,
     pub exp: usize,
+    pub token_type: String,
 }
