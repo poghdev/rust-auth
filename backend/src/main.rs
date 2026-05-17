@@ -1,9 +1,9 @@
-mod routes;
 mod models;
+mod routes;
 mod security;
 
-use security::rate_limit::{RateLimitConfigs, spawn_cleanup_task};
 use models::AppState;
+use security::rate_limit::{spawn_cleanup_task, RateLimitConfigs};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -20,11 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     sqlx::migrate!("./migrations").run(&pool).await?;
 
-    let state = AppState {
-        pool,
-        jwt_secret: std::env::var("JWT_SECRET")
-            .unwrap_or_else(|_| "dev_secret_key_change_me".into()),
-    };
+    let state = AppState::from_env(pool);
 
     let rl_configs = RateLimitConfigs::new();
     spawn_cleanup_task(&rl_configs, 60);

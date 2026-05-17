@@ -1,65 +1,40 @@
-use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
-use axum::http::header::{HeaderMap, SET_COOKIE, COOKIE};
-use jsonwebtoken::{EncodingKey, DecodingKey, Header, Validation, encode, decode};
-use validator::Validate;
 use argon2::{
     password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
 };
-use std::time::{SystemTime, UNIX_EPOCH};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use axum::http::HeaderMap;
+use sha2::{Digest, Sha256};
+use time::OffsetDateTime;
+use validator::Validate;
 
-use crate::models::{AppState, AuthRequest, AuthResponse, Claims};
+use crate::models::{AppState, AuthRequest, AuthResponse};
+use crate::routes::cookies::{append_cookie, cookie_clear, cookie_set, get_cookie};
+use crate::routes::extractor::AuthenticatedUser;
+use crate::routes::jwt::{
+    make_access_token, make_refresh_token, verify_jwt,
+    ACCESS_TTL, REFRESH_TTL, JwtError,
+};
 
-const ACCESS_TOKEN_TTL:  u64 = 15 * 60;
-const REFRESH_TOKEN_TTL: u64 = 7 * 24 * 3600;
-
-pub fn extract_claims(headers: &HeaderMap, cookie_name: &str, secret: &str) -> Result<Claims, StatusCode> {
-    let cookie_header = headers
-        .get(COOKIE)
-        .and_then(|h| h.to_str().ok())
-        .ok_or(StatusCode::UNAUTHORIZED)?;
-
-    let token = cookie_header
-        .split(';')
-        .find(|s| s.trim().starts_with(&format!("{}=", cookie_name)))
-        .and_then(|s| s.trim().splitn(2, '=').nth(1))
-        .ok_or(StatusCode::UNAUTHORIZED)?;
-
-    let token_data = decode::<Claims>(
-        token,
-        &DecodingKey::from_secret(secret.as_ref()),
-        &Validation::default(),
-    )
-    .map_err(|_| StatusCode::UNAUTHORIZED)?;
-
-    Ok(token_data.claims)
+fn sha256(input: &str) -> String {
+    format!("{:x}", Sha256::new().chain_update(input).finalize())
 }
 
-fn make_token(username: &str, ttl_secs: u64, token_type: &str, secret: &str) -> Result<String, StatusCode> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .as_secs();
-
-    let claims = Claims {
-        sub: username.to_string(),
-        exp: (now + ttl_secs) as usize,
-        token_type: token_type.to_string(),
-    };
-
-    encode(
-        &Header::default(),
-        &claims,
-        &EncodingKey::from_secret(secret.as_ref()),
-    )
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
-}
-
-fn make_cookie(name: &str, value: &str, max_age: u64) -> String {
-    format!(
-        "{}={}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}",
-        name, value, max_age
-    )
+fn jwt_err_to_status(e: JwtError) -> StatusCode {
+    match e {
+        JwtError::TimeError => {
+            tracing::error!("System clock error when creating JWT");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+        JwtError::EncodingError => {
+            tracing::error!("JWT encoding failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+        JwtError::DecodingError => {
+            tracing::warn!("JWT decoding failed (invalid or expired token)");
+            StatusCode::UNAUTHORIZED
+        }
+    }
 }
 
 pub async fn register(
@@ -69,21 +44,32 @@ pub async fn register(
     payload.validate().map_err(|_| StatusCode::BAD_REQUEST)?;
 
     let salt = SaltString::generate(&mut OsRng);
-    let password_hash = Argon2::default()
+    let hash = Argon2::default()
         .hash_password(payload.password.as_bytes(), &salt)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|e| {
+            tracing::error!("Argon2 hashing failed: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
         .to_string();
 
     sqlx::query!(
         "INSERT INTO users (username, password_hash) VALUES ($1, $2)",
         payload.username,
-        password_hash
+        hash,
     )
     .execute(&state.pool)
     .await
-    .map_err(|_| StatusCode::BAD_REQUEST)?;
+    .map_err(|e| {
+        if let sqlx::Error::Database(db_err) = &e {
+            if db_err.code().as_deref() == Some("23505") {
+                return StatusCode::CONFLICT;
+            }
+        }
+        tracing::error!("DB error on register: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
-    Ok((StatusCode::CREATED, "User registered"))
+    Ok(StatusCode::CREATED)
 }
 
 pub async fn login(
@@ -93,133 +79,231 @@ pub async fn login(
     payload.validate().map_err(|_| StatusCode::BAD_REQUEST)?;
 
     let row = sqlx::query!(
-        "SELECT password_hash FROM users WHERE username = $1",
-        payload.username
+        "SELECT id, password_hash FROM users WHERE username = $1",
+        payload.username,
     )
     .fetch_optional(&state.pool)
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    .ok_or(StatusCode::UNAUTHORIZED)?;
+    .map_err(|e| {
+        tracing::error!("DB error on login lookup: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
-    let parsed_hash = PasswordHash::new(&row.password_hash)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let hash_to_check = row
+        .as_ref()
+        .map(|r| r.password_hash.as_str())
+        .unwrap_or(&state.dummy_hash);
 
-    Argon2::default()
-        .verify_password(payload.password.as_bytes(), &parsed_hash)
-        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let parsed = PasswordHash::new(hash_to_check).map_err(|e| {
+        tracing::error!("Failed to parse password hash: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
-    let access_token  = make_token(&payload.username, ACCESS_TOKEN_TTL,  "access",  &state.jwt_secret)?;
-    let refresh_token = make_token(&payload.username, REFRESH_TOKEN_TTL, "refresh", &state.jwt_secret)?;
+    let password_ok = Argon2::default()
+        .verify_password(payload.password.as_bytes(), &parsed)
+        .is_ok();
+
+    let user = match (row, password_ok) {
+        (Some(u), true) => u,
+        _ => return Err(StatusCode::UNAUTHORIZED),
+    };
+
+    let access_token  = make_access_token(&payload.username, &state.jwt_secret)
+        .map_err(jwt_err_to_status)?;
+    let refresh_token = make_refresh_token(&payload.username, &state.jwt_secret)
+        .map_err(jwt_err_to_status)?;
+
+    let token_hash = sha256(&refresh_token);
+    let expires_at = OffsetDateTime::now_utc() + time::Duration::seconds(REFRESH_TTL as i64);
+
+    sqlx::query!("DELETE FROM refresh_tokens WHERE user_id = $1", user.id)
+        .execute(&state.pool)
+        .await
+        .map_err(|e| {
+            tracing::error!("DB error deleting old refresh tokens: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    sqlx::query!(
+        "INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)",
+        user.id,
+        token_hash,
+        expires_at,
+    )
+    .execute(&state.pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("DB error inserting refresh token: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     let mut headers = HeaderMap::new();
-    headers.insert(SET_COOKIE, make_cookie("access_token",  &access_token,  ACCESS_TOKEN_TTL) .parse().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?);
-    headers.append(SET_COOKIE, make_cookie("refresh_token", &refresh_token, REFRESH_TOKEN_TTL).parse().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?);
+    append_cookie(&mut headers, cookie_set("access_token",  &access_token,  ACCESS_TTL))?;
+    append_cookie(&mut headers, cookie_set("refresh_token", &refresh_token, REFRESH_TTL))?;
 
     Ok((headers, Json(AuthResponse { message: "Login successful".into() })))
 }
 
-pub async fn access_token(
+pub async fn logout(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let claims = extract_claims(&headers, "access_token", &state.jwt_secret)?;
+    if let Some(raw) = get_cookie(&headers, "refresh_token") {
+        let token_hash = sha256(&raw);
+        if let Err(e) = sqlx::query!(
+            "DELETE FROM refresh_tokens WHERE token_hash = $1",
+            token_hash,
+        )
+        .execute(&state.pool)
+        .await
+        {
+            tracing::warn!("DB error during logout (non-fatal): {}", e);
+        }
+    }
 
-    if claims.token_type != "access" {
+    let mut resp = HeaderMap::new();
+    append_cookie(&mut resp, cookie_clear("access_token"))?;
+    append_cookie(&mut resp, cookie_clear("refresh_token"))?;
+
+    Ok((resp, Json(AuthResponse { message: "Logged out".into() })))
+}
+
+// Rotation: старый refresh токен уничтожается атомарно, выдаётся новый access + refresh.
+// Frontend вызывает этот endpoint каждые 14 минут чтобы не дать access_token истечь.
+pub async fn do_refresh_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, StatusCode> {
+    let raw = get_cookie(&headers, "refresh_token").ok_or(StatusCode::UNAUTHORIZED)?;
+
+    let claims = verify_jwt(&raw, &state.jwt_secret).map_err(jwt_err_to_status)?;
+    if claims.token_type != "refresh" {
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    Ok(Json(serde_json::json!({ "username": claims.sub })))
+    let token_hash = sha256(&raw);
+
+    let row = sqlx::query!(
+        "DELETE FROM refresh_tokens
+         WHERE token_hash = $1 AND expires_at > NOW()
+         RETURNING user_id",
+        token_hash,
+    )
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("DB error on refresh token delete: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    let new_access  = make_access_token(&claims.sub, &state.jwt_secret)
+        .map_err(jwt_err_to_status)?;
+    let new_refresh = make_refresh_token(&claims.sub, &state.jwt_secret)
+        .map_err(jwt_err_to_status)?;
+
+    let new_hash   = sha256(&new_refresh);
+    let expires_at = OffsetDateTime::now_utc() + time::Duration::seconds(REFRESH_TTL as i64);
+
+    sqlx::query!(
+        "INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)",
+        row.user_id,
+        new_hash,
+        expires_at,
+    )
+    .execute(&state.pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("DB error inserting new refresh token: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let mut resp = HeaderMap::new();
+    append_cookie(&mut resp, cookie_set("access_token",  &new_access,  ACCESS_TTL))?;
+    append_cookie(&mut resp, cookie_set("refresh_token", &new_refresh, REFRESH_TTL))?;
+
+    Ok((resp, Json(AuthResponse { message: "Token refreshed".into() })))
 }
 
-pub async fn refresh_token(
+// Верифицирует access_token через глобальный AuthenticatedUser extractor.
+// Возвращает username из payload.
+pub async fn get_access_token(
+    AuthenticatedUser(claims): AuthenticatedUser,
+) -> impl IntoResponse {
+    Json(serde_json::json!({ "username": claims.sub }))
+}
+
+// Проверяет авторизацию:
+// 1. Если access_token валидный — сразу OK.
+// 2. Если истёк — проверяет refresh_token в БД.
+// 3. Если refresh валидный — выдаёт новый access_token (без rotation refresh).
+//    Для полного rotation пусть frontend вызывает /refresh-token явно.
+pub async fn protected_route(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let claims = extract_claims(&headers, "refresh_token", &state.jwt_secret)?;
+    // Сначала пробуем access token
+    if let Some(raw) = get_cookie(&headers, "access_token") {
+        if let Ok(claims) = verify_jwt(&raw, &state.jwt_secret) {
+            if claims.token_type == "access" {
+                return Ok((
+                    HeaderMap::new(),
+                    Json(serde_json::json!({
+                        "authorized": true,
+                        "username":   claims.sub,
+                        "refreshed":  false,
+                    })),
+                ));
+            }
+        }
+    }
+
+    // Access истёк — пробуем refresh token
+    let raw_refresh = get_cookie(&headers, "refresh_token")
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    let claims = verify_jwt(&raw_refresh, &state.jwt_secret)
+        .map_err(jwt_err_to_status)?;
 
     if claims.token_type != "refresh" {
         return Err(StatusCode::UNAUTHORIZED);
     }
 
+    let token_hash = sha256(&raw_refresh);
+
+    // Проверяем что refresh токен живёт в БД и не истёк
     let exists = sqlx::query_scalar!(
-        "SELECT EXISTS(SELECT 1 FROM users WHERE username = $1)",
-        claims.sub
+        "SELECT EXISTS(
+            SELECT 1 FROM refresh_tokens
+            WHERE token_hash = $1 AND expires_at > NOW()
+        )",
+        token_hash,
     )
     .fetch_one(&state.pool)
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .map_err(|e| {
+        tracing::error!("DB error checking refresh token: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
     .unwrap_or(false);
 
     if !exists {
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    let new_access_token = make_token(&claims.sub, ACCESS_TOKEN_TTL, "access", &state.jwt_secret)?;
+    // Выдаём новый access token. Refresh не трогаем — rotation только через /refresh-token.
+    let new_access = make_access_token(&claims.sub, &state.jwt_secret)
+        .map_err(jwt_err_to_status)?;
 
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        SET_COOKIE,
-        make_cookie("access_token", &new_access_token, ACCESS_TOKEN_TTL)
-            .parse()
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
-    );
-
-    Ok((headers, Json(AuthResponse { message: "Token refreshed".into() })))
-}
-
-pub async fn protected_route(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<impl IntoResponse, StatusCode> {
-    if let Ok(claims) = extract_claims(&headers, "access_token", &state.jwt_secret) {
-        if claims.token_type == "access" {
-            return Ok((
-                HeaderMap::new(),
-                Json(serde_json::json!({
-                    "authorized": true,
-                    "username": claims.sub,
-                    "token_refreshed": false
-                })),
-            ));
-        }
-    }
-
-    let refresh_claims = extract_claims(&headers, "refresh_token", &state.jwt_secret)
-        .map_err(|_| StatusCode::UNAUTHORIZED)?;
-
-    if refresh_claims.token_type != "refresh" {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-
-    let exists = sqlx::query_scalar!(
-        "SELECT EXISTS(SELECT 1 FROM users WHERE username = $1)",
-        refresh_claims.sub
-    )
-    .fetch_one(&state.pool)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    .unwrap_or(false);
-
-    if !exists {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-
-    let new_access_token = make_token(&refresh_claims.sub, ACCESS_TOKEN_TTL, "access", &state.jwt_secret)?;
-
-    let mut response_headers = HeaderMap::new();
-    response_headers.insert(
-        SET_COOKIE,
-        make_cookie("access_token", &new_access_token, ACCESS_TOKEN_TTL)
-            .parse()
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
-    );
+    let mut resp = HeaderMap::new();
+    append_cookie(&mut resp, cookie_set("access_token", &new_access, ACCESS_TTL))?;
 
     Ok((
-        response_headers,
+        resp,
         Json(serde_json::json!({
             "authorized": true,
-            "username": refresh_claims.sub,
-            "token_refreshed": true
+            "username":   claims.sub,
+            "refreshed":  true,
         })),
     ))
 }

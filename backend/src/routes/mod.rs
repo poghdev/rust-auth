@@ -1,4 +1,4 @@
-use axum::{Router, routing::{post, get}};
+use axum::{Router, routing::{get, post}};
 use axum::http::{HeaderValue, Method, header::{CONTENT_TYPE, COOKIE}};
 use tower_http::cors::CorsLayer;
 
@@ -6,6 +6,9 @@ use crate::models::AppState;
 use crate::security::rate_limit::{RateLimitConfigs, auth_rate_limit_layer, general_rate_limit_layer};
 
 pub mod auth;
+pub mod cookies;
+pub mod extractor;
+pub mod jwt;
 
 pub fn create_router(state: AppState, rl: RateLimitConfigs) -> Router {
     let cors = CorsLayer::new()
@@ -23,8 +26,9 @@ pub fn create_router(state: AppState, rl: RateLimitConfigs) -> Router {
         .layer(auth_rate_limit_layer(rl.auth.clone()));
 
     let auth_general = Router::new()
-        .route("/access-token",    get(auth::access_token))
-        .route("/refresh-token",   post(auth::refresh_token))
+        .route("/logout",          post(auth::logout))
+        .route("/refresh-token",   post(auth::do_refresh_token))
+        .route("/access-token",    get(auth::get_access_token))
         .route("/protected-route", get(auth::protected_route))
         .layer(general_rate_limit_layer(rl.general.clone()));
 
